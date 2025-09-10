@@ -67,25 +67,33 @@ const ResumeImporter: React.FC<ResumeImporterProps> = ({ onDataImported, onClose
       const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
       
       if (isPDF) {
-        // Use the backend server for PDF parsing
+        setProcessingStep('Extracting text from PDF...');
+        
+        // Try multiple PDF parsing approaches
         const formData = new FormData();
         formData.append('file', file);
         
-        const response = await fetch('http://localhost:4004/api/parse-pdf', {
-          method: 'POST',
-          body: formData,
-        });
-        
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          throw new Error(errorData.error || `Server error: ${response.status}`);
+        // Try the server endpoint first
+        try {
+          const response = await fetch('http://localhost:5000/extract-pdf', {
+            method: 'POST',
+            body: formData,
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            text = data.text || '';
+          } else {
+            throw new Error('Server extraction failed');
+          }
+        } catch (serverError) {
+          console.log('Server extraction failed, trying client-side...');
+          // Fallback to client-side PDF parsing using pdf-parse
+          text = await extractPDFTextClientSide(file);
         }
-        
-        const data = await response.json();
-        text = data.text || '';
-        
       } else {
         // Handle text files directly
+        setProcessingStep('Reading text file...');
         text = await new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = (e) => resolve(e.target?.result as string || '');
@@ -94,8 +102,12 @@ const ResumeImporter: React.FC<ResumeImporterProps> = ({ onDataImported, onClose
         });
       }
       
+      if (!text || text.trim().length < 10) {
+        throw new Error('No readable text found in the file');
+      }
+      
       setExtractedText(text);
-      setProcessingStep('Analyzing content...');
+      setProcessingStep('Analyzing content with AI...');
       const parsedData = await parseResumeTextAdvanced(text);
       setExtractedData(parsedData);
       toast.success('Resume data extracted successfully!');
@@ -110,8 +122,58 @@ const ResumeImporter: React.FC<ResumeImporterProps> = ({ onDataImported, onClose
     }
   };
 
+  // Client-side PDF text extraction
+  const extractPDFTextClientSide = async (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const arrayBuffer = e.target?.result as ArrayBuffer;
+          if (!arrayBuffer) {
+            reject(new Error('Failed to read file'));
+            return;
+          }
+          
+          // Simple PDF text extraction (basic approach)
+          const uint8Array = new Uint8Array(arrayBuffer);
+          const textDecoder = new TextDecoder('utf-8');
+          let text = textDecoder.decode(uint8Array);
+          
+          // Extract readable text from PDF content
+          const textMatches = text.match(/\(([^)]+)\)/g);
+          if (textMatches) {
+            text = textMatches
+              .map(match => match.slice(1, -1))
+              .filter(str => str.length > 2 && /[a-zA-Z]/.test(str))
+              .join(' ');
+          }
+          
+          // If no readable text found, try alternative extraction
+          if (!text || text.trim().length < 10) {
+            // Try to extract text between common PDF markers
+            const binaryString = String.fromCharCode.apply(null, Array.from(uint8Array));
+            const textRegex = /BT\s*(.*?)\s*ET/g;
+            const matches = [];
+            let match;
+            while ((match = textRegex.exec(binaryString)) !== null) {
+              matches.push(match[1]);
+            }
+            text = matches.join(' ').replace(/[^\w\s@.-]/g, ' ').replace(/\s+/g, ' ').trim();
+          }
+          
+          resolve(text);
+        } catch (error) {
+          reject(new Error('Failed to extract text from PDF'));
+        }
+      };
+      reader.onerror = () => reject(new Error('Failed to read file'));
+      reader.readAsArrayBuffer(file);
+    });
+  };
   // Improved resume parsing function
   const parseResumeTextAdvanced = async (text: string): Promise<ResumeData> => {
+    console.log('Parsing text:', text.substring(0, 200) + '...');
+    
     const resumeData: ResumeData = {
       personalInfo: {
         name: '',
@@ -128,130 +190,236 @@ const ResumeImporter: React.FC<ResumeImporterProps> = ({ onDataImported, onClose
       projects: []
     };
 
-    // Extract email
-    const emailMatch = text.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/);
+    // Enhanced email extraction
+    const emailMatch = text.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g);
     if (emailMatch) resumeData.personalInfo.email = emailMatch[0];
 
-    // Extract phone (more comprehensive pattern)
-    const phoneMatch = text.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
+    // Enhanced phone extraction with Indian patterns
+    const phonePatterns = [
+      /(\+91[-.\s]?)?\d{10}/g, // Indian format
+      /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, // International
+      /\d{3}[-.\s]?\d{3}[-.\s]?\d{4}/g // US format
+    ];
+    
+    let phoneMatch = null;
+    for (const pattern of phonePatterns) {
+      phoneMatch = text.match(pattern);
+      if (phoneMatch) break;
+    }
     if (phoneMatch) resumeData.personalInfo.phone = phoneMatch[0];
 
-    // Extract LinkedIn
-    const linkedinMatch = text.match(/(linkedin\.com\/in\/[a-zA-Z0-9\-]+)|(linkedin\.com\/company\/[a-zA-Z0-9\-]+)/i);
+    // Enhanced LinkedIn extraction
+    const linkedinPatterns = [
+      /linkedin\.com\/in\/[a-zA-Z0-9\-]+/gi,
+      /linkedin\.com\/company\/[a-zA-Z0-9\-]+/gi,
+      /LinkedIn:\s*([a-zA-Z0-9\-\/]+)/gi
+    ];
+    
+    let linkedinMatch = null;
+    for (const pattern of linkedinPatterns) {
+      linkedinMatch = text.match(pattern);
+      if (linkedinMatch) break;
+    }
     if (linkedinMatch) {
-      resumeData.personalInfo.linkedin = linkedinMatch[0].startsWith('http') 
+      const linkedinUrl = linkedinMatch[0].includes('linkedin.com') 
         ? linkedinMatch[0] 
-        : `https://${linkedinMatch[0]}`;
+        : `linkedin.com/in/${linkedinMatch[0].replace('LinkedIn:', '').trim()}`;
+      resumeData.personalInfo.linkedin = linkedinUrl.startsWith('http') 
+        ? linkedinUrl 
+        : `https://${linkedinUrl}`;
     }
 
-    // Extract GitHub
-    const githubMatch = text.match(/(github\.com\/[a-zA-Z0-9\-]+)|(GitHub:\s*[a-zA-Z0-9\-]+)/i);
+    // Enhanced GitHub extraction
+    const githubPatterns = [
+      /github\.com\/[a-zA-Z0-9\-]+/gi,
+      /GitHub:\s*([a-zA-Z0-9\-\/]+)/gi,
+      /git:\s*([a-zA-Z0-9\-\/]+)/gi
+    ];
+    
+    let githubMatch = null;
+    for (const pattern of githubPatterns) {
+      githubMatch = text.match(pattern);
+      if (githubMatch) break;
+    }
     if (githubMatch) {
-      const match = githubMatch[0].includes('github.com') 
+      const githubUrl = githubMatch[0].includes('github.com') 
         ? githubMatch[0] 
-        : `github.com/${githubMatch[0].replace('GitHub:', '').trim()}`;
-      resumeData.personalInfo.github = match.startsWith('http') ? match : `https://${match}`;
+        : `github.com/${githubMatch[0].replace(/GitHub:|git:/i, '').trim()}`;
+      resumeData.personalInfo.github = githubUrl.startsWith('http') 
+        ? githubUrl 
+        : `https://${githubUrl}`;
     }
 
-    // Extract name (improved pattern)
+    // Enhanced name extraction with multiple patterns
     const namePatterns = [
-      /^[A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?$/m, // First Last or First Middle Last
-      /(?:^|\n)[A-Z][a-z]+ [A-Z]\.? [A-Z][a-z]+/, // First M. Last
-      /(?:^|\n)[A-Z][a-z]+, [A-Z][a-z]+(?: [A-Z][a-z]+)?/ // Last, First
+      /^[A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?$/m,
+      /(?:^|\n)\s*([A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?)\s*$/m,
+      /Name:\s*([A-Z][a-z]+ [A-Z][a-z]+)/i,
+      /([A-Z][A-Z\s]+)\s*Software|Developer|Engineer/i,
+      /^([A-Z][a-z]+ [A-Z][a-z]+)/m
     ];
     
     for (const pattern of namePatterns) {
       const match = text.match(pattern);
       if (match) {
-        resumeData.personalInfo.name = match[0].replace(/^\n/, '').trim();
+        const extractedName = (match[1] || match[0]).replace(/^\n/, '').trim();
+        if (extractedName.length > 3 && extractedName.length < 50) {
+          resumeData.personalInfo.name = extractedName;
+        }
         break;
       }
     }
 
-    // Extract location (city, state, or country)
-    const locationMatch = text.match(/(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,?\s*(?:[A-Z]{2}\b|\b(?:USA|United States|Canada|UK|United Kingdom)\b))/);
+    // Enhanced location extraction
+    const locationPatterns = [
+      /(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,?\s*(?:[A-Z]{2}\b|\b(?:USA|United States|Canada|UK|United Kingdom|India)\b))/g,
+      /Location:\s*([^,\n]+(?:,\s*[^,\n]+)?)/i,
+      /Address:\s*([^,\n]+(?:,\s*[^,\n]+)?)/i,
+      /([A-Z][a-z]+,\s*[A-Z][a-z]+)/g
+    ];
+    
+    let locationMatch = null;
+    for (const pattern of locationPatterns) {
+      locationMatch = text.match(pattern);
+      if (locationMatch) break;
+    }
     if (locationMatch) resumeData.personalInfo.location = locationMatch[0];
 
-    // Extract summary
+    // Enhanced summary extraction
     const summaryPatterns = [
-      /(?:summary|objective|profile)[:\s]*([^]+?)(?=\n\s*\n|\n\s*[A-Z][^a-z]|\n\s*[a-z]+\s*:)/i,
-      /(?:^|\n)\s*([A-Z][^.!?]{50,300}[.!?])(?=\n\s*\n|\n\s*[A-Z][^a-z])/
+      /(?:summary|objective|profile|about)[:\s]*([^]+?)(?=\n\s*\n|\n\s*(?:experience|education|skills|projects))/i,
+      /(?:professional\s+summary|career\s+objective)[:\s]*([^]+?)(?=\n\s*\n|\n\s*[A-Z][^a-z])/i,
+      /(?:^|\n)\s*([A-Z][^.!?]{50,400}[.!?])(?=\n\s*\n|\n\s*[A-Z][^a-z])/m
     ];
     
     for (const pattern of summaryPatterns) {
       const match = text.match(pattern);
       if (match && match[1] && match[1].length > 30) {
-        resumeData.personalInfo.summary = match[1].trim();
+        resumeData.personalInfo.summary = match[1].trim().replace(/\s+/g, ' ');
         break;
       }
     }
 
-    // Extract skills (expanded list)
+    // Enhanced skills extraction with expanded list
     const commonSkills = [
-      'JavaScript', 'TypeScript', 'Python', 'Java', 'C#', 'C++', 'PHP', 'Ruby', 'Go', 'Swift', 'Kotlin',
-      'React', 'Angular', 'Vue', 'Svelte', 'Next.js', 'Nuxt.js', 'Node.js', 'Express', 'Django', 'Flask',
-      'Spring', 'Laravel', 'Ruby on Rails', 'jQuery', 'Bootstrap', 'Tailwind CSS', 'SASS', 'LESS',
-      'HTML', 'CSS', 'REST', 'GraphQL', 'gRPC', 'MySQL', 'PostgreSQL', 'MongoDB', 'Redis', 'SQLite',
-      'Firebase', 'AWS', 'Azure', 'Google Cloud', 'Docker', 'Kubernetes', 'Jenkins', 'Git', 'CI/CD',
-      'Agile', 'Scrum', 'TDD', 'DevOps', 'Machine Learning', 'Data Science', 'TensorFlow', 'PyTorch'
+      // Programming Languages
+      'JavaScript', 'TypeScript', 'Python', 'Java', 'C#', 'C++', 'PHP', 'Ruby', 'Go', 'Swift', 'Kotlin', 'Rust', 'Scala',
+      // Frontend Technologies
+      'React', 'Angular', 'Vue', 'Svelte', 'Next.js', 'Nuxt.js', 'jQuery', 'Bootstrap', 'Tailwind CSS', 'SASS', 'LESS',
+      'HTML', 'CSS', 'HTML5', 'CSS3', 'Webpack', 'Vite', 'Parcel',
+      // Backend Technologies
+      'Node.js', 'Express', 'Django', 'Flask', 'Spring', 'Laravel', 'Ruby on Rails', 'ASP.NET', 'FastAPI',
+      // Databases
+      'MySQL', 'PostgreSQL', 'MongoDB', 'Redis', 'SQLite', 'Oracle', 'SQL Server', 'Cassandra', 'DynamoDB',
+      // Cloud & DevOps
+      'AWS', 'Azure', 'Google Cloud', 'Docker', 'Kubernetes', 'Jenkins', 'Git', 'CI/CD', 'Terraform', 'Ansible',
+      // Data & AI
+      'Machine Learning', 'Data Science', 'TensorFlow', 'PyTorch', 'Pandas', 'NumPy', 'Scikit-learn', 'Jupyter',
+      // Mobile Development
+      'React Native', 'Flutter', 'iOS', 'Android', 'Xamarin',
+      // Other Technologies
+      'REST', 'GraphQL', 'gRPC', 'Firebase', 'Agile', 'Scrum', 'TDD', 'DevOps', 'Microservices',
+      // Soft Skills
+      'Leadership', 'Communication', 'Problem Solving', 'Team Management', 'Project Management'
     ];
     
     const foundSkills: string[] = [];
     for (const skill of commonSkills) {
-      // Case-insensitive match with word boundaries
-      const regex = new RegExp(`\\b${skill}\\b`, 'i');
+      const regex = new RegExp(`\\b${skill.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
       if (regex.test(text) && !foundSkills.some(s => s.toLowerCase() === skill.toLowerCase())) {
         foundSkills.push(skill);
       }
     }
+    
+    // Also look for skills in a dedicated skills section
+    const skillsSectionMatch = text.match(/(?:skills|technologies|technical\s+skills)[:\s]*([^]+?)(?=\n\s*(?:experience|education|projects|$))/i);
+    if (skillsSectionMatch) {
+      const skillsText = skillsSectionMatch[1];
+      const additionalSkills = skillsText.split(/[,\n•\-\|]/)
+        .map(skill => skill.trim())
+        .filter(skill => skill.length > 2 && skill.length < 30)
+        .filter(skill => !foundSkills.some(existing => existing.toLowerCase() === skill.toLowerCase()));
+      foundSkills.push(...additionalSkills.slice(0, 10)); // Limit additional skills
+    }
+    
     resumeData.skills = foundSkills;
 
-    // Extract experience (improved pattern)
+    // Enhanced experience extraction
     const experiencePatterns = [
-      /([^•\n]+?)\s*[-–—]\s*([^•\n]+?)\s*[-–—]\s*([^•\n]+?)\s*[-–—]\s*([^•\n]*?(?:\n.*?)*?)(?=\n\s*(?:[A-Z][^a-z]|$))/g,
-      /([^•\n]+?)\s*at\s*([^•\n]+?)\s*[-–—]\s*([^•\n]+?)(?:\n.*?)*?(?=\n\s*(?:[A-Z][^a-z]|$))/g,
-      /(.*?)\n(.*?)\n(.*?)\n(.*?(?:\n.*?)*?)(?=\n\s*\n)/g
+      /(?:^|\n)\s*([A-Z][^,\n]+?)\s*[-–—@]\s*([^,\n]+?)\s*[-–—|]\s*([^,\n]+?)(?:\n([^]+?))?(?=\n\s*(?:[A-Z][^a-z]|\n\s*\n|$))/gm,
+      /([A-Z][^,\n]+?)\s+at\s+([^,\n]+?)\s*[-–—|]\s*([^,\n]+?)(?:\n([^]+?))?(?=\n\s*(?:[A-Z][^a-z]|\n\s*\n|$))/gm,
+      /Position:\s*([^,\n]+?)\s*Company:\s*([^,\n]+?)\s*Duration:\s*([^,\n]+?)(?:\s*Description:\s*([^]+?))?(?=\n\s*(?:Position|Company|$))/gi
     ];
     
-    const experienceSection = text.match(/experience[\s\S]*?(?=education|skills|projects|$)/i)?.[0] || text;
+    // Look for experience section first
+    const experienceSection = text.match(/(?:experience|work\s+history|employment)[\s\S]*?(?=education|skills|projects|$)/i)?.[0] || text;
     
     for (const pattern of experiencePatterns) {
       let match;
       while ((match = pattern.exec(experienceSection)) !== null) {
-        if (match[1] && match[2] && match[3]) {
+        if (match[1] && match[2]) {
           resumeData.experience.push({
             title: match[1].trim(),
             company: match[2].trim(),
-            duration: match[3].trim(),
-            description: match[4] ? match[4].trim() : 'Experience details extracted from resume.'
+            duration: match[3] ? match[3].trim() : '',
+            description: match[4] ? match[4].trim().replace(/\s+/g, ' ') : 'Experience details extracted from resume.'
           });
         }
       }
+      if (resumeData.experience.length > 0) break; // Stop if we found experiences
     }
 
-    // Extract education (improved pattern)
+    // Enhanced education extraction
     const educationPatterns = [
-      /([^•\n]+?)\s*[-–—]\s*([^•\n]+?)\s*[-–—]\s*([^•\n]+?)(?:\n.*?)*?(?=\n\s*(?:[A-Z][^a-z]|$))/g,
-      /(.*?)\n(.*?)\n(.*?)\n(?=\n\s*\n)/g,
-      /(Bachelor|Master|PhD|B\.S\.|B\.A\.|M\.S\.|M\.A\.|Ph\.D\.).*?(University|College|Institute|School).*?(\d{4})/gi
+      /(Bachelor|Master|PhD|B\.S\.|B\.A\.|M\.S\.|M\.A\.|Ph\.D\.|B\.Tech|M\.Tech|B\.E\.|M\.E\.)([^,\n]*?)(?:from\s+)?([^,\n]*?(?:University|College|Institute|School)[^,\n]*?)(?:[,\s]*(\d{4}(?:\s*[-–—]\s*\d{4})?|\d{4}\s*[-–—]\s*(?:Present|Current)))?/gi,
+      /Degree:\s*([^,\n]+?)\s*Institution:\s*([^,\n]+?)\s*Year:\s*([^,\n]+?)/gi,
+      /Education:\s*([^,\n]+?)\s*[-–—]\s*([^,\n]+?)\s*[-–—]\s*([^,\n]+?)/gi
     ];
     
-    const educationSection = text.match(/education[\s\S]*?(?=experience|skills|projects|$)/i)?.[0] || text;
+    const educationSection = text.match(/(?:education|academic|qualification)[\s\S]*?(?=experience|skills|projects|$)/i)?.[0] || text;
     
     for (const pattern of educationPatterns) {
       let match;
       while ((match = pattern.exec(educationSection)) !== null) {
-        if (match[1] && match[2]) {
+        if (match[1] && match[3]) {
           resumeData.education.push({
-            degree: match[1].trim(),
-            institution: match[2].trim(),
-            year: match[3] ? match[3].trim() : '',
-            gpa: match[4] ? match[4].trim() : ''
+            degree: (match[1] + (match[2] || '')).trim(),
+            institution: match[3].trim(),
+            year: match[4] ? match[4].trim() : '',
+            gpa: ''
           });
         }
       }
+      if (resumeData.education.length > 0) break; // Stop if we found education
     }
 
+    // Enhanced projects extraction
+    const projectPatterns = [
+      /(?:projects?|portfolio)[\s\S]*?(?=experience|education|skills|$)/i
+    ];
+    
+    const projectSection = text.match(projectPatterns[0]);
+    if (projectSection) {
+      const projectText = projectSection[0];
+      const projectMatches = projectText.match(/([A-Z][^,\n]{10,50})\s*[-–—:]\s*([^]+?)(?=\n\s*[A-Z][^,\n]{10,50}\s*[-–—:]|\n\s*\n|$)/g);
+      
+      if (projectMatches) {
+        projectMatches.forEach(match => {
+          const parts = match.split(/\s*[-–—:]\s*/);
+          if (parts.length >= 2) {
+            resumeData.projects = resumeData.projects || [];
+            resumeData.projects.push({
+              name: parts[0].trim(),
+              description: parts[1].trim().replace(/\s+/g, ' '),
+              technologies: '',
+              link: ''
+            });
+          }
+        });
+      }
+    }
+
+    console.log('Parsed resume data:', resumeData);
     return resumeData;
   };
 

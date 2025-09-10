@@ -119,6 +119,17 @@ const ResumeBuilder: React.FC = () => {
   const handleImportData = (importedData: ResumeData) => {
     reset(importedData);
     localStorage.setItem('resumeData', JSON.stringify(importedData));
+    
+    // Also update portfolio data automatically
+    const portfolioData = {
+      personalInfo: importedData.personalInfo,
+      skills: importedData.skills,
+      projects: importedData.projects || [],
+      experience: importedData.experience,
+      education: importedData.education
+    };
+    localStorage.setItem('portfolioData', JSON.stringify(portfolioData));
+    
     toast.success('Resume data imported successfully!');
     setShowImporter(false);
   };

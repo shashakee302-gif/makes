@@ -7,14 +7,34 @@ const path = require('path');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 const upload = multer();
 
 app.post('/extract-pdf', upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    console.log('Processing PDF:', req.file.originalname, 'Size:', req.file.size);
     const data = await pdfParse(req.file.buffer);
-    res.json({ text: data.text });
+    
+    if (!data.text || data.text.trim().length === 0) {
+      return res.status(400).json({ error: 'No text could be extracted from the PDF' });
+    }
+    
+    console.log('Extracted text length:', data.text.length);
+    res.json({ 
+      text: data.text,
+      pages: data.numpages,
+      info: data.info
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to extract PDF text.' });
+    console.error('PDF extraction error:', err);
+    res.status(500).json({ 
+      error: 'Failed to extract PDF text.',
+      details: err.message 
+    });
   }
 });
 
